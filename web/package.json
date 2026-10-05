@@ -1,0 +1,25 @@
+{
+  "name": "resolveonce-console",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3016",
+    "build": "next build",
+    "start": "next start --port 3016",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "genlayer-js": "2.0.0-rc.1",
+    "next": "16.3.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.3",
+    "typescript": "^5"
+  }
+}
