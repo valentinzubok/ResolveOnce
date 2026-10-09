@@ -16,7 +16,7 @@ One commit, 11 files, 1 225 insertions and 92 deletions.
 
 | File | Change | What |
 |---|---:|---|
-| `contracts/ResolveOnce.py` | +331 −45 | payable `predict`, `claim`, `withdraw_credit`, four views, the stake parameter, the gap-free digest |
+| `contracts/ResolveOnce.py` | +313 −18 | payable `predict`, `claim`, `withdraw_credit`, four views, the stake parameter, the gap-free digest |
 | `tests/test_stakes.py` | +469 | new — 21 tests for the money |
 | `tests/conftest.py` | +73 | the test double learns value, balance and external transfers |
 | `web/src/components/ResolveOnceApp.tsx` | +139 | stake field, staked predict, pot, claim button, credit banner |
