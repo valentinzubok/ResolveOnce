@@ -587,11 +587,11 @@ export function ResolveOnceApp() {
               )}
               {m.status === "resolved" && (
                 <p className="verdictbox">
-                  <strong>final: {m.final_label}.</strong> {book.filter((p) => p.correct).length}{" "}
-                  of {book.length} prediction(s) were right
+                  <strong>final: {m.final_label}.</strong> {m.tally[m.final_index] || 0} of{" "}
+                  {m.tally.reduce((sum, n) => sum + n, 0)} prediction(s) were right
                   {mine ? ` — yours was ${mine.correct ? "right" : "wrong"}` : ""}.
                   {staked &&
-                    (book.some((p) => p.correct)
+                    ((m.tally[m.final_index] || 0) > 0
                       ? " The winners split the pot in equal shares."
                       : " Nobody was right, so every stake goes back.")}
                 </p>
