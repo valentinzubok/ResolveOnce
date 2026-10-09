@@ -2,12 +2,13 @@
 # { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
 
 import genlayer as gl
+from genlayer.types import Address
 import hashlib
 import json
 import re
 from datetime import datetime, timezone
 
-# ResolveOnce v1 — a market resolution that nobody is trusted to announce.
+# ResolveOnce v2 — a market resolution that nobody is trusted to announce, with real stakes.
 # Copyright (c) 2026 Valentyn Zubok. MIT License.
 #
 # A prediction market is only as honest as whoever says how it ended. ResolveOnce removes
@@ -31,6 +32,20 @@ from datetime import datetime, timezone
 # Finality is the consequential action, so a malformed model answer, a model error or a
 # consensus failure REVERTS the transaction: no round is recorded. There is no owner, no
 # admin and no privileged address; the creator has no power once the market exists.
+#
+# v2 puts money behind the answer. A market may fix a stake: every prediction then escrows
+# exactly that much GEN in this contract, and the escrow has exactly three ways out:
+#
+#   * the market resolves and somebody was right -> the winners split the whole pot
+#   * the market resolves and nobody was right   -> every predictor takes their stake back
+#   * the market expires unresolved              -> every predictor takes their stake back
+#
+# Nobody can route the pot anywhere else: there is no fee, no owner cut and no withdrawal
+# function other than a predictor's own claim. Two facts about the network shape the code:
+# value attached to a call that REVERTS is not returned, so predict() never raises once
+# value is attached (what it cannot escrow becomes a credit the sender withdraws); and a
+# wallet is paid with an EXTERNAL transfer, because an internal message only reaches
+# Intelligent Contracts and would leave the money sitting here.
 
 MAX_ID_LEN = 64
 MAX_QUESTION_LEN = 300
@@ -42,6 +57,7 @@ MAX_URL_LEN = 2048
 MAX_MARKETS = 200
 MAX_PREDICTIONS = 200
 MAX_EVENTS = 200
+MAX_STAKE_WEI = 10**24  # 1,000,000 GEN per prediction; keeps the pot arithmetic small
 
 EVIDENCE_BUDGET_CHARS = 4000
 WINDOW_CHARS = 500
@@ -183,27 +199,63 @@ def _keywords(*texts) -> list:
 
 
 def build_digest(normalized: str, anchor_text: str) -> dict:
-    """Bounded deterministic view of the WHOLE document, anchored on the market's words."""
+    """Bounded deterministic view of the WHOLE document.
+
+    A document that fits the budget is kept whole, so nothing in a short page can fall
+    between windows. A longer one gets the head, then windows around the market's own
+    words, then - if windows and budget remain - the first uncovered stretches,
+    so a keyword that landed inside an existing window never leaves a gap unread.
+    """
     doc = normalized
     total = len(doc)
+    if total <= EVIDENCE_BUDGET_CHARS:
+        excerpts = [{"from_char": 0, "match": "whole_document", "text": doc}] if doc else []
+        return {
+            "excerpts": excerpts,
+            "excerpt_chars": total,
+            "total_chars": total,
+            "covers_whole_document": True,
+        }
+
     windows = []
 
-    def add(start: int, label: str) -> None:
+    def add(start: int, label: str) -> bool:
         start = max(0, min(start, max(0, total - 1)))
         end = min(total, start + WINDOW_CHARS)
         for w in windows:
             if not (end <= w["start"] or start >= w["end"]):
-                return
+                return False
         windows.append({"start": start, "end": end, "label": label})
+        return True
 
     add(0, "head")
     lowered = doc.lower()
     for word in _keywords(anchor_text):
         if len(windows) >= MAX_WINDOWS:
             break
+        # Try every occurrence, not only the first: an early mention inside a window that
+        # is already kept must not hide a later one elsewhere in the document.
         idx = lowered.find(word)
-        if idx >= 0:
-            add(max(0, idx - WINDOW_CHARS // 4), word)
+        while idx >= 0:
+            if add(max(0, idx - WINDOW_CHARS // 4), word):
+                break
+            idx = lowered.find(word, idx + 1)
+
+    # Spend what is left on text nobody has looked at yet, from the top down.
+    cursor = 0
+    while len(windows) < MAX_WINDOWS and cursor < total:
+        covering = [w for w in windows if w["start"] <= cursor < w["end"]]
+        if covering:
+            cursor = max(w["end"] for w in covering)
+            continue
+        following = [w["start"] for w in windows if w["start"] > cursor]
+        gap_end = min(following) if following else total
+        if gap_end - cursor >= WINDOW_CHARS or not following:
+            add(cursor, "uncovered")
+            cursor += WINDOW_CHARS
+        else:
+            windows.append({"start": cursor, "end": gap_end, "label": "uncovered"})
+            cursor = gap_end
 
     windows.sort(key=lambda w: w["start"])
     excerpts = []
@@ -238,6 +290,27 @@ def injection_flags(*texts) -> list:
             if marker in low and marker not in found:
                 found.append(marker)
     return found
+
+
+@gl.evm.contract_interface
+class _Wallet:
+    """An account on the chain layer. A wallet (EOA) has no methods, only a balance."""
+
+    class View:
+        pass
+
+    class Write:
+        pass
+
+
+def pay_wallet(address: str, amount: int) -> None:
+    """Send native GEN from this contract's balance to a wallet, applied on finalization.
+
+    A wallet lives on the chain layer, so this is an external message through the
+    contract's ghost contract. An internal message to a wallet is emitted and never
+    credited - the transaction succeeds and the balance does not move.
+    """
+    _Wallet(Address(address)).emit_transfer(value=amount)
 
 
 def now_seconds() -> int:
@@ -416,6 +489,7 @@ class ResolveOnce(gl.contract.Contract):
     markets_json: str
     order_json: str
     predictions_json: str
+    credits_json: str
     events_json: str
     rounds: str
 
@@ -424,6 +498,7 @@ class ResolveOnce(gl.contract.Contract):
         self.markets_json = "{}"
         self.order_json = "[]"
         self.predictions_json = "{}"
+        self.credits_json = "{}"
         self.events_json = "[]"
         self.rounds = "0"
 
@@ -440,6 +515,14 @@ class ResolveOnce(gl.contract.Contract):
 
     def _save_predictions(self, predictions):
         self.predictions_json = json.dumps(predictions, sort_keys=True, separators=(",", ":"))
+
+    def _credit(self, address: str, amount: int) -> None:
+        """Book GEN this contract holds for `address` and owes back on request."""
+        if amount <= 0:
+            return
+        credits = json.loads(self.credits_json)
+        credits[address] = str(int(credits.get(address, "0")) + amount)
+        self.credits_json = json.dumps(credits, sort_keys=True, separators=(",", ":"))
 
     def _event(self, kind: str, payload: dict):
         events = json.loads(self.events_json)
@@ -470,6 +553,7 @@ class ResolveOnce(gl.contract.Contract):
         confirmations_required: str = "2",
         confirm_interval: str = "3600",
         expire_in: str = "2592000",
+        stake: str = "0",
     ) -> None:
         """Commit everything a resolution depends on. Nothing here can be changed later.
 
@@ -480,6 +564,10 @@ class ResolveOnce(gl.contract.Contract):
 
         confirmations_required rounds must name the same outcome, each at least
         confirm_interval seconds after the previous accepted round, before it is final.
+
+        stake is the GEN (in wei) every prediction must escrow; "0" keeps the market free.
+        It is fixed here like everything else, and equal for everyone, so the pot is always
+        stake * predictions and a winner's share is the pot divided by the winners.
         """
         mid = _normalize_id(market_id)
         markets = self._load()
@@ -505,6 +593,7 @@ class ResolveOnce(gl.contract.Contract):
         expires_in = parse_seconds(
             "expire_in", expire_in, MIN_INTERVAL_SECONDS, 2 * MAX_HORIZON_SECONDS
         )
+        stake_wei = parse_small_int("stake", stake, 0, MAX_STAKE_WEI)
         # Leave room for every confirmation round to happen before the market can expire.
         if expires_in < open_in + required * interval:
             raise Exception(
@@ -540,6 +629,10 @@ class ResolveOnce(gl.contract.Contract):
             "final_label": "",
             "resolved_at": 0,
             "tally": [0 for _ in outcomes],
+            "stake": str(stake_wei),
+            "pot": "0",
+            "paid_out": "0",
+            "claims": 0,
         }
         self._save(markets)
         order = json.loads(self.order_json)
@@ -554,40 +647,87 @@ class ResolveOnce(gl.contract.Contract):
                 "resolve_at": now + open_in,
                 "confirmations_required": required,
                 "confirm_interval": interval,
+                "stake": str(stake_wei),
                 "at": now,
             },
         )
 
-    @gl.public.write
-    def predict(self, market_id: str, outcome_index: str) -> None:
-        """Record one prediction per address. It cannot be changed or withdrawn."""
-        mid, markets = self._market_or_raise(market_id)
+    @gl.public.write.payable
+    def predict(self, market_id: str, outcome_index: str) -> str:
+        """Record one prediction per address. It cannot be changed or withdrawn.
+
+        On a staked market the call must carry the market's stake, which is escrowed in
+        this contract until the market resolves or expires.
+
+        Value attached to a call that reverts is not returned by the network. So this
+        method raises only when no value is attached; with value it always completes, and
+        whatever it could not escrow is booked as a credit for the sender (see
+        withdraw_credit). The returned JSON says what happened: `recorded`, `escrowed`,
+        `credited` and, when the prediction was refused, `reason`.
+        """
+        value = int(gl.message.value)
+        caller = str(gl.message.sender_address)
+
+        def refuse(reason: str) -> str:
+            if value <= 0:
+                raise Exception(reason)
+            self._credit(caller, value)
+            return json.dumps(
+                {"recorded": False, "escrowed": "0", "credited": str(value), "reason": reason},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        try:
+            mid = _normalize_id(market_id)
+        except Exception as exc:
+            return refuse(str(exc))
+        markets = self._load()
+        if mid not in markets:
+            return refuse("unknown market_id")
         market = markets[mid]
         if market.get("status") not in (STATUS_OPEN, STATUS_PROPOSED):
-            raise Exception("market is closed")
+            return refuse("market is closed")
         now = now_seconds()
         if now >= int(market.get("predictions_close_at", 0)):
-            raise Exception("predictions are closed for this market")
+            return refuse("predictions are closed for this market")
         outcomes = market.get("outcomes", [])
-        index = parse_small_int("outcome_index", outcome_index, 0, len(outcomes) - 1)
+        try:
+            index = parse_small_int("outcome_index", outcome_index, 0, len(outcomes) - 1)
+        except Exception as exc:
+            return refuse(str(exc))
 
         predictions = self._load_predictions()
         book = predictions.get(mid, {})
-        caller = str(gl.message.sender_address)
         if caller in book:
-            raise Exception("this address has already predicted on this market")
+            return refuse("this address has already predicted on this market")
         if len(book) >= MAX_PREDICTIONS:
-            raise Exception("this market has reached its prediction limit")
-        book[caller] = {"outcome": index, "at": now}
+            return refuse("this market has reached its prediction limit")
+        stake = int(market.get("stake", "0"))
+        if value < stake:
+            return refuse("this market needs a stake of " + str(stake) + " wei per prediction")
+
+        excess = value - stake
+        book[caller] = {"outcome": index, "at": now, "stake": str(stake), "claimed": False}
         predictions[mid] = book
         self._save_predictions(predictions)
 
         tally = list(market.get("tally", [0 for _ in outcomes]))
         tally[index] = int(tally[index]) + 1
         market["tally"] = tally
+        market["pot"] = str(int(market.get("pot", "0")) + stake)
         markets[mid] = market
         self._save(markets)
-        self._event("Predicted", {"id": mid, "by": caller, "outcome": index, "at": now})
+        self._credit(caller, excess)
+        self._event(
+            "Predicted",
+            {"id": mid, "by": caller, "outcome": index, "stake": str(stake), "at": now},
+        )
+        return json.dumps(
+            {"recorded": True, "escrowed": str(stake), "credited": str(excess)},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     @gl.public.write
     def resolve(self, market_id: str) -> None:
@@ -753,6 +893,96 @@ class ResolveOnce(gl.contract.Contract):
         self._save(markets)
         self._event("Voided", {"id": mid, "by": str(gl.message.sender_address), "at": now})
 
+    def _settlement(self, market: dict, book: dict, address: str) -> dict:
+        """What `address` can take out of a market right now, and why."""
+        entry = book.get(address)
+        status = market.get("status")
+        stake = int(market.get("stake", "0"))
+        result = {"amount": 0, "kind": "nothing", "reason": ""}
+        if entry is None:
+            result["reason"] = "this address has no prediction on this market"
+            return result
+        if entry.get("claimed", False):
+            result["reason"] = "already claimed"
+            return result
+        if stake <= 0:
+            result["reason"] = "this market has no stakes"
+            return result
+        if status == STATUS_VOID:
+            return {"amount": stake, "kind": "refund", "reason": "market expired unresolved"}
+        if status != STATUS_RESOLVED:
+            result["reason"] = "market is not final yet"
+            return result
+        final_index = int(market.get("final_index", -1))
+        winners = int(list(market.get("tally", []))[final_index]) if final_index >= 0 else 0
+        if winners <= 0:
+            return {"amount": stake, "kind": "refund", "reason": "nobody predicted the result"}
+        if int(entry.get("outcome", -1)) != final_index:
+            result["reason"] = "this prediction was not the final outcome"
+            return result
+        # Equal stakes, so equal shares. Integer division: at most winners-1 wei of dust
+        # stays in the contract, and no claim can ever take more than the pot holds.
+        share = int(market.get("pot", "0")) // winners
+        return {"amount": share, "kind": "winnings", "reason": "predicted the final outcome"}
+
+    @gl.public.write
+    def claim(self, market_id: str) -> str:
+        """Take your share of a settled market: winnings, or your stake back.
+
+        Only the predictor can claim, and only for themselves. The books are updated
+        before the transfer is emitted, so a second claim finds nothing left to take.
+        """
+        mid, markets = self._market_or_raise(market_id)
+        market = markets[mid]
+        caller = str(gl.message.sender_address)
+        predictions = self._load_predictions()
+        book = predictions.get(mid, {})
+        settlement = self._settlement(market, book, caller)
+        amount = int(settlement["amount"])
+        if amount <= 0:
+            raise Exception("nothing to claim: " + settlement["reason"])
+        if int(self.balance) < amount:
+            raise Exception("contract balance is lower than the amount owed")
+
+        book[caller]["claimed"] = True
+        predictions[mid] = book
+        self._save_predictions(predictions)
+        market["paid_out"] = str(int(market.get("paid_out", "0")) + amount)
+        market["claims"] = int(market.get("claims", 0)) + 1
+        markets[mid] = market
+        self._save(markets)
+        self._event(
+            "Claimed",
+            {
+                "id": mid,
+                "by": caller,
+                "what": settlement["kind"],
+                "amount": str(amount),
+                "at": now_seconds(),
+            },
+        )
+        pay_wallet(caller, amount)
+        return json.dumps(
+            {"kind": settlement["kind"], "amount": str(amount)},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @gl.public.write
+    def withdraw_credit(self) -> str:
+        """Take back GEN that predict() could not escrow for you."""
+        caller = str(gl.message.sender_address)
+        credits = json.loads(self.credits_json)
+        amount = int(credits.get(caller, "0"))
+        if amount <= 0:
+            raise Exception("no credit for this address")
+        if int(self.balance) < amount:
+            raise Exception("contract balance is lower than the amount owed")
+        del credits[caller]
+        self.credits_json = json.dumps(credits, sort_keys=True, separators=(",", ":"))
+        pay_wallet(caller, amount)
+        return str(amount)
+
     # ── views ─────────────────────────────────────────────────────────────────
 
     @gl.public.view
@@ -836,10 +1066,70 @@ class ResolveOnce(gl.contract.Contract):
                 "outcome": int(book[address]["outcome"]),
                 "at": int(book[address]["at"]),
             }
+            row["stake"] = str(book[address].get("stake", "0"))
+            row["claimed"] = bool(book[address].get("claimed", False))
             if final:
                 row["correct"] = row["outcome"] == final_index
             rows.append(row)
         return json.dumps(rows, separators=(",", ":"))
+
+    @gl.public.view
+    def get_pot(self, market_id: str) -> str:
+        """The money side of a market: stake, pot, what has been paid, a winner's share."""
+        mid = _normalize_id(market_id)
+        markets = self._load()
+        if mid not in markets:
+            return json.dumps({"error": "unknown market_id"})
+        market = markets[mid]
+        stake = int(market.get("stake", "0"))
+        pot = int(market.get("pot", "0"))
+        final_index = int(market.get("final_index", -1))
+        tally = list(market.get("tally", []))
+        winners = int(tally[final_index]) if final_index >= 0 else 0
+        status = market.get("status")
+        if status == STATUS_RESOLVED and winners > 0:
+            mode, share = "winners_split_pot", pot // winners
+        elif status == STATUS_RESOLVED or status == STATUS_VOID:
+            mode, share = "everyone_refunded", stake
+        else:
+            mode, share = "escrowed", 0
+        return json.dumps(
+            {
+                "market_id": mid,
+                "stake": str(stake),
+                "pot": str(pot),
+                "paid_out": market.get("paid_out", "0"),
+                "claims": int(market.get("claims", 0)),
+                "predictions": sum(int(n) for n in tally),
+                "winners": winners,
+                "mode": mode,
+                "share": str(share),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @gl.public.view
+    def get_claimable(self, market_id: str, address: str) -> str:
+        """What `address` could claim from a market right now. Free to read."""
+        mid = _normalize_id(market_id)
+        markets = self._load()
+        if mid not in markets:
+            return json.dumps({"error": "unknown market_id"})
+        book = self._load_predictions().get(mid, {})
+        settlement = self._settlement(markets[mid], book, str(address))
+        settlement["amount"] = str(settlement["amount"])
+        return json.dumps(settlement, sort_keys=True, separators=(",", ":"))
+
+    @gl.public.view
+    def get_credit(self, address: str) -> str:
+        """GEN (in wei) this contract owes back to `address` outside any market."""
+        return str(int(json.loads(self.credits_json).get(str(address), "0")))
+
+    @gl.public.view
+    def get_balance(self) -> str:
+        """GEN (in wei) this contract actually holds right now."""
+        return str(int(self.balance))
 
     @gl.public.view
     def list_ids(self) -> str:
@@ -859,11 +1149,14 @@ class ResolveOnce(gl.contract.Contract):
         markets = self._load()
         counts = {STATUS_OPEN: 0, STATUS_PROPOSED: 0, STATUS_RESOLVED: 0, STATUS_VOID: 0}
         predictions = 0
+        staked = paid_out = 0
         for row in markets.values():
             status = row.get("status")
             if status in counts:
                 counts[status] += 1
             predictions += sum(int(n) for n in row.get("tally", []))
+            staked += int(row.get("pot", "0"))
+            paid_out += int(row.get("paid_out", "0"))
         return json.dumps(
             {
                 "markets": len(markets),
@@ -872,6 +1165,8 @@ class ResolveOnce(gl.contract.Contract):
                 "resolved": counts[STATUS_RESOLVED],
                 "void": counts[STATUS_VOID],
                 "predictions": predictions,
+                "staked": str(staked),
+                "paid_out": str(paid_out),
                 "rounds": int(self.rounds),
             },
             separators=(",", ":"),

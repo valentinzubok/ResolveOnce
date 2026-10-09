@@ -6,6 +6,8 @@ Knobs:
   gl.llm_reply          raw model output (str/dict, or an Exception to raise)
   gl.comparative_fails  when True, eq_principle.prompt_comparative raises
   gl.prompts            every prompt sent, for assertions about quoting
+  gl.balance            GEN (wei) the contract holds; pay() adds to it, payouts subtract
+  gl.transfers          every external wallet transfer the contract emitted: (address, wei)
 """
 
 from __future__ import annotations
@@ -23,14 +25,48 @@ def _install_fake_genlayer() -> None:
     gl = types.ModuleType("genlayer")
     gl._fake_genvm = True
 
-    class _Public:
-        @staticmethod
-        def write(fn):
+    class _Write:
+        """`@gl.public.write` and `@gl.public.write.payable`."""
+
+        def __call__(self, fn):
+            fn._payable = False
             return fn
+
+        @staticmethod
+        def payable(fn):
+            fn._payable = True
+            return fn
+
+    class _Public:
+        write = _Write()
 
         @staticmethod
         def view(fn):
             return fn
+
+    class _Contract:
+        """Base class: a contract can read its own balance."""
+
+        @property
+        def balance(self):
+            return gl.balance
+
+    class _WalletProxy:
+        def __init__(self, address):
+            self.address = str(address)
+
+        def emit_transfer(self, value=0, **kwargs):
+            """An external native transfer. It cannot send what the contract does not hold."""
+            if kwargs:
+                raise TypeError("external transfers take no `on` argument")
+            amount = int(value)
+            if amount <= 0 or amount > gl.balance:
+                raise Exception("transfer exceeds the contract balance")
+            gl.balance -= amount
+            gl.transfers.append((self.address, amount))
+
+    def _evm_interface(cls):
+        return _WalletProxy
 
     class _EqPrinciple:
         @staticmethod
@@ -58,9 +94,16 @@ def _install_fake_genlayer() -> None:
             raise reply
         return reply
 
-    gl.contract = types.SimpleNamespace(Contract=object)
+    gl.contract = types.SimpleNamespace(Contract=_Contract)
     gl.public = _Public()
-    gl.message = types.SimpleNamespace(sender_address="0x1111111111111111111111111111111111111111")
+    gl.evm = types.SimpleNamespace(contract_interface=_evm_interface)
+    gl.message = types.SimpleNamespace(
+        sender_address="0x1111111111111111111111111111111111111111", value=0
+    )
+    gl_types = types.ModuleType("genlayer.types")
+    gl_types.Address = str
+    gl.types = gl_types
+    sys.modules["genlayer.types"] = gl_types
     gl.eq_principle = _EqPrinciple()
     gl.nondet = types.SimpleNamespace(
         web=types.SimpleNamespace(render=_render),
@@ -72,6 +115,8 @@ def _install_fake_genlayer() -> None:
     gl.llm_reply = '{"determined": true, "outcome": 0}'
     gl.comparative_fails = False
     gl.prompts = []
+    gl.balance = 0
+    gl.transfers = []
     sys.modules["genlayer"] = gl
 
 
@@ -113,4 +158,24 @@ def reset(gl) -> None:
     gl.llm_reply = '{"determined": true, "outcome": 0}'
     gl.comparative_fails = False
     gl.prompts = []
+    gl.balance = 0
+    gl.transfers = []
+    gl.message.value = 0
     gl.message.sender_address = "0x1111111111111111111111111111111111111111"
+
+
+def pay(gl, method, value: int, *args):
+    """Call a contract method with `value` wei attached, the way the network does it.
+
+    The value reaches the contract balance whether or not the call succeeds: on the real
+    network a reverted call does not return what was attached. A non-payable method
+    refuses value outright.
+    """
+    if value and not getattr(method, "_payable", False):
+        raise Exception("method is not payable")
+    gl.message.value = int(value)
+    gl.balance += int(value)
+    try:
+        return method(*args)
+    finally:
+        gl.message.value = 0

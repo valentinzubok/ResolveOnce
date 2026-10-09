@@ -1,78 +1,105 @@
-# ResolveOnce v1 — Studio Dev (chain 61997) deploy record
+# ResolveOnce v2 — Studio Dev (chain 61997) deploy record
 
 | | |
 |---|---|
 | **Network** | GenLayer Studio Dev / Studio Next — chain `61997`, GenVM `v0.3.0` |
-| **Contract** | [`0x6FB445e8edC50A7B01C88faBf8B0E925a2001355`](https://explorer-studio-dev.genlayer.com/address/0x6FB445e8edC50A7B01C88faBf8B0E925a2001355) |
+| **Contract (v2)** | [`0xE4cBaaF13Aaf6aF3c8c5414bB5BaC1e5E60ABcBc`](https://explorer-studio-dev.genlayer.com/address/0xE4cBaaF13Aaf6aF3c8c5414bB5BaC1e5E60ABcBc) |
 | **Source** | [`contracts/ResolveOnce.py`](contracts/ResolveOnce.py) — runner `py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng` |
-| **Source sha256** | `4546dd20eca08335112fcf184d54c69b17260af776a3b3c458741435e2270e93` |
-| **Console** | https://valentinzubok.github.io/ResolveOnce/ · [ResolveOnce](https://github.com/valentinzubok/ResolveOnce) |
-| **Deployer** | `0x4130dC892bD57009Ba795d746354072465b84412` — a separate test account; it also places the losing prediction below |
-| **Market creator in the demo** | `0xBA989D240AAB780d3d2eD2201f5F677098901408` (test account) |
+| **Source sha256** | `352092f4416a18c79b85684af40da544753462e5eeafc88d5c5c0124d8452084` |
+| **Console** | https://valentinzubok.github.io/ResolveOnce/ |
+| **Account A** | `0x9b4D377af0D74d965a82aa2E8E429873299a67b1` — test account: deployer, market creator, predicts "Passed" |
+| **Account B** | `0x68D0CaF57A525AD9146B7dF81c8c5E3871ba7Bf9` — test account: predicts "Rejected" |
 | **Owner / admin** | none — the contract has no privileged address; `get_admin()` returns `""` |
+
+The v1 deployment the Project was accepted with is
+[`0x6FB445e8edC50A7B01C88faBf8B0E925a2001355`](https://explorer-studio-dev.genlayer.com/address/0x6FB445e8edC50A7B01C88faBf8B0E925a2001355);
+its source and record are in
+[ResolveOnceCore](https://github.com/valentinzubok/ResolveOnceCore). What v2 adds is described in
+[`docs/MILESTONE_STAKES.md`](docs/MILESTONE_STAKES.md).
 
 ## Verify that the deployed code equals this source
 
 ```bash
 curl -s -X POST https://studio-dev.genlayer.com/api -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"gen_getContractCode","params":["0x6FB445e8edC50A7B01C88faBf8B0E925a2001355"]}' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"gen_getContractCode","params":["0xE4cBaaF13Aaf6aF3c8c5414bB5BaC1e5E60ABcBc"]}' \
   | python3 -c "import sys,json,base64,hashlib; print(hashlib.sha256(base64.b64decode(json.load(sys.stdin)['result'])).hexdigest())"
 shasum -a 256 contracts/ResolveOnce.py
-# both print 4546dd20eca08335112fcf184d54c69b17260af776a3b3c458741435e2270e93
+# both print 352092f4416a18c79b85684af40da544753462e5eeafc88d5c5c0124d8452084
 ```
 
 `scripts/verify_deployment.py` does the same check and runs in CI. The constructor takes no
 arguments, so the deployed code is this file and nothing else.
 
-## On-chain lifecycle
+## On-chain lifecycle: 7 GEN in, 7 GEN out
 
-Both source pages are files in the console repository:
-[`web/public/fixtures/`](https://github.com/valentinzubok/ResolveOnce/tree/main/web/public/fixtures).
+Two markets, both with a stake of 1 GEN per prediction. `dao/42` reads
+[`vote-final.html`](web/public/fixtures/vote-final.html) (a certified result) and needs two agreeing
+rounds 120 s apart. `dao/43` reads [`vote-open.html`](web/public/fixtures/vote-open.html) (voting
+still open) and expires after 240 s.
 
-Market `dao/42` reads `vote-final.html` (a certified result) with `confirmations_required = 2` and
-`confirm_interval = 180`. Market `dao/43` reads `vote-open.html` (voting still open, 64.6% in
-favour, "polls expect the proposal to pass").
+The **balance** column is the contract's native GEN balance from `eth_getBalance`, read after the
+step had been finalized.
 
-| # | Caller | Step | Result | Tx |
-|---|--------|------|--------|----|
-| 0 | deployer | deploy | contract created | `0xb0bd5d09a148824ee98b063516b48aa813db1c27fb683e90b0683e0f54fc0d4f` |
-| 1 | creator | `create_market("dao/42", …, vote-final.html, …, predictions_close_in=120, resolve_in=180, confirmations_required=2, confirm_interval=180, expire_in=86400)` | open; created at `1791227756`, `resolve_at = 1791227936` | `0x6d8f483a2b39b6294a5d179c838cd55e85a0c4667ebe1110694bebf43ff8bc77` |
-| 2 | creator | `create_market("dao/43", …, vote-open.html, …, resolve_in=120, confirmations_required=1, confirm_interval=120)` | open | `0x4c04a42ab01d1d40040db9ee2557fe5f898749f3e904a04d8c911899c42799ee` |
-| 3 | creator | `predict("dao/42", 0)` — Passed | recorded | `0x15d44b842889612a166a75e4ab65b282b1352f97f7dc4b3dac6acb64150463c8` |
-| 4 | deployer | `predict("dao/42", 1)` — Rejected | recorded | `0xea717eb471d539c8f3ee8c993f1042710adef7da316f635e962b43b1e9a9ef29` |
-| 5 | creator | `resolve("dao/42")` before the resolve time | **reverted** — `a resolution round is not accepted yet; the next one is accepted at 1791227936`. The page was not fetched. | `0xe730b609b5c8a60d9c948f9fe62c11d7d3f6dc9e56452a0b481d67efa562c6c6` (ERROR) |
-| 6 | creator | `resolve("dao/42")` at `1791227939` | **proposed, 1 of 2** — validators agreed the page states "Passed". Not final. `next_round_at` moves to this transaction + 180 s. | `0x434f4b539f5d7c27441cc9d98671e6e3a17a13f5ee759116a0e08d9e2f62ee0b` |
-| 7 | creator | `resolve("dao/42")` again, immediately | **reverted** — `…the next one is accepted at 1791228119`: 180 s after step 6, not at the next multiple of 180. | `0x5e6daeac2c579e98825b1378dd9c7b565b8911b76fb77c8829eb185876227759` (ERROR) |
-| 8 | creator | `resolve("dao/43")` | **undetermined** — validators agreed the page does not state a final result. Nothing proposed, even though this market needs only one confirmation and the page shows a leading side and a forecast. | `0x98e86b22ffa6f033e877ea9cb36787ff91fc519d8014b4ee61b67147d0d2a57a` |
-| 9 | creator | `resolve("dao/42")` at `1791228125` | **resolved: Passed** — second agreeing round, 186 s after the first, same page hash. Final. | `0x5472b39868d256ce12765260611beac47675db3dac9a42b92e8440fae40946ac` |
+| # | Who | Call | Result | Balance | Tx |
+|---|-----|------|--------|--------:|----|
+| 0 | A | deploy | contract created | 0 | `0xbd99a89b424ad0d9045a3de34b4b1c068084c342e671b48b5d5a1e8d705b5e01` |
+| 1 | A | `create_market("dao/42", …, vote-final.html, …, 150, 180, 2, 120, 86400, stake=1 GEN)` | open | 0 | `0x113cab606d6e3861ede60aba6f7663559c00218e6c9b4a39549f20c7830b0164` |
+| 2 | A | `create_market("dao/43", …, vote-open.html, …, 90, 90, 1, 60, 240, stake=1 GEN)` | open | 0 | `0xc2453989162874c4b28f246b7747d2036a18c831733b0c680aa61377e0efbdb2` |
+| 3 | A | `predict("dao/43", 0)` + 1 GEN | escrowed | 1 | `0x5218f595a59795d84d9dac46b03c846a9b55750dc9edde39900244bc1b321f98` |
+| 4 | B | `predict("dao/43", 1)` + 1 GEN | escrowed | 2 | `0x3f0572c507b0c084b81d6ee1ccb33b3590e769e3487ca8d00f2035be39fa9a7c` |
+| 5 | A | `predict("dao/42", 0)` + 1 GEN | escrowed | 3 | `0x9ca74d67aff6e3c74a01d16394c561da3f18d94f2371ba50dd666f1825ebb9d5` |
+| 6 | B | `predict("dao/42", 1)` + **3 GEN** | 1 GEN escrowed, **2 GEN credited back** to B | 6 | `0xdf9a8416977262b985885b071e009011921577fcdc412b7363e36ba020cdcb02` |
+| 7 | A | `predict("dao/42", 1)` + 1 GEN, a second prediction | **refused without reverting**: nothing recorded, 1 GEN credited back to A | **7** | `0x3a2f89196e950980def401b5038085d2bb266729e6f7ac6fc7959daca7c75998` |
+| 8 | B | `predict("dao/43", 0)` with no value, a second prediction | reverted — `this address has already predicted on this market` | 7 | `0x958205874a226024997f1b0152217d647d4db8bc2f26896f7568f2326ffaef46` (ERROR) |
+| 9 | A | `claim("dao/42")` before it is final | reverted — `nothing to claim: market is not final yet` | 7 | `0xf5db8b4f29836e70caf73db1168bc2a496e013b5817dfa8169f5ec6d10e9ad5b` (ERROR) |
+| 10 | B | `withdraw_credit()` | 2 GEN back to B's wallet | 5 | `0x13e29d4c64bee2d434f6997df331079d7fe88a8ce657805d0cec22e4a2d62aa3` |
+| 11 | A | `withdraw_credit()` | 1 GEN back to A's wallet | **4** | `0x339da6685ed8f4f6a53fb04c3d107c8623ede771aa8951075e400ac10bb78617` |
+| 12 | A | `resolve("dao/43")` | **undetermined** — the page shows a live tally and a forecast, not a result | 4 | `0x0ef9392daa537d6361f2a638ac55bb021640dc2fe9464dd1a837f26d68e8a3a6` |
+| 13 | A | `resolve("dao/42")` at `1791563337` | **proposed: Passed**, 1 of 2 | 4 | `0x26816d3d938d4a50f45dc657e28c10e70b3001522da38b94b7edef160936f89e` |
+| 14 | A | `resolve("dao/42")` at `1791563469`, 132 s later | **resolved: Passed**, final | 4 | `0xe0d52e65fd541688ea48240d81f896b31994c5184076fbb61ec726224ea598e9` |
+| 15 | B | `claim("dao/42")` — the loser | reverted — `nothing to claim: this prediction was not the final outcome` | 4 | `0x34ff35918633417d7e81bb35a8a4d4035650aa27c17ae51ae72a2734bbc3fae4` (ERROR) |
+| 16 | A | `claim("dao/42")` — the winner | **2 GEN (the whole pot) to A's wallet** | **2** | `0x37649defee2f2df1e02d95a5cfbcbef34db41c90d5026c933a97b908e5114b55` |
+| 17 | A | `claim("dao/42")` again | reverted — `nothing to claim: already claimed` | 2 | `0xa6544e380e6754c82f3cc77e160ebe06abb3622cbf8ac4cf07a41ed746713383` (ERROR) |
+| 18 | B | `expire("dao/43")` after 240 s | **void** — expired without a final result | 2 | `0x5368fc6744dcab7b2442684d1d21e74d68ea886f99045280f2eeda518397214e` |
+| 19 | A | `claim("dao/43")` | 1 GEN stake back | 1 | `0xb6e29baea2d8787fcf3c4301dff5182b91ffab7b11896c078e9acb3ecbf21226` |
+| 20 | B | `claim("dao/43")` | 1 GEN stake back | **0** | `0x0b8dccca6410fdc4204ad6924b6abc8ebf52f72829c03d97641da34f806dcd24` |
 
-State after step 9:
+`get_stats` afterwards:
+`{"markets":2,"open":0,"proposed":0,"resolved":1,"void":1,"predictions":4,"staked":"4000000000000000000","paid_out":"4000000000000000000","rounds":3}`
+and `get_balance` is `0`.
 
-- `get_outcome("dao/42")` → `{"final":true,"outcome_index":0,"outcome_label":"Passed","status":"resolved",…}`
-- `get_predictions("dao/42")` → the creator's `Passed` is `correct: true`, the deployer's `Rejected`
-  is `correct: false`. Deploying the contract bought no say in the result.
-- `dao/43` is still `open` with `last_round: "undetermined"`; it will be voided by `expire()` if
-  the page never carries a result.
-- `get_stats` → `{"markets":2,"open":1,"proposed":0,"resolved":1,"void":0,"predictions":2,"rounds":3}`:
-  five `resolve` transactions, three accepted rounds.
+Where the 7 GEN went: 4 were staked (2 per market) and 3 were sent in excess or to a refused
+prediction. All 3 came back through `withdraw_credit`; the 4 staked left through `claim` — 2 as
+winnings on `dao/42`, 2 as refunds on `dao/43`. Nothing stayed in the contract.
 
-The intervals are minutes here so the flow can be reproduced quickly; a real market would use
-hours or days (`confirm_interval` accepts 60 s – 30 days, the horizons up to 365 days).
+A's wallet around step 16, in wei: `2687896516926749955905` → `2689896224904499953730`, that is
++2 GEN less the fees of the two calls in between.
 
-### A note on the page renderer's cache
+Two things this run does not show, both covered by `tests/test_stakes.py`: several winners sharing
+a pot (including the rounding dust), and a market that resolves to an outcome nobody predicted.
 
-Studio Dev's page renderer can serve a cached copy of a URL for several minutes, so a round right
-after a commit to a source page may legitimately read the previous text. That is one more reason a
-single round is only a proposal. The demo above uses pages that did not change during the run.
+### Notes for anyone reproducing this
+
+- A payout is applied when the transaction is **finalized**, a few seconds to a couple of minutes
+  after it is accepted. A balance read straight after `claim` can still show the old value.
+- Step 8 was meant to show an unpaid prediction on a staked market. B had already predicted on
+  `dao/43`, so the duplicate check fired first. The underpaid case is in the tests
+  (`needs a stake`).
+- The intervals are minutes so the flow can be reproduced quickly; a real market would use hours or
+  days.
+- An earlier v2 deployment, `0x28b9550628007f57d03EEC36971099c73B766F1a`, was abandoned before this
+  run: its `Claimed` event wrote the payout type under the key `kind`, overwriting the event's own
+  kind. The key is now `what`. Test stakes from the interrupted run are still in that contract.
 
 ## Design notes for reviewers
 
 | Concern | Where it is handled |
 |---|---|
-| Rate limits must be elapsed time, not calendar windows | `next_round_at` is stored per market and set to `now + confirm_interval` by every accepted round; `tests/test_adversarial.py::test_two_calls_straddling_a_clock_boundary_are_still_one_round`. |
-| No privileged override of user-held state | No owner storage, constructor argument or ownership transfer; no `cancel`/`void`/`force_resolve`; `test_the_committed_terms_have_no_setter`, `test_the_creator_and_the_deployer_have_no_special_power_after_creation`. |
-| Model output validated as literal JSON types | `literal_bool` and `literal_index`; nineteen malformed replies in `test_a_malformed_answer_reverts_and_records_nothing`. |
-| Fail closed | No `strict_eq` fallback for the verdict; `principle` passed positionally; `test_a_consensus_failure_reverts_even_one_round_from_final`. A reverted round leaves no trace: the round counters are written only after the verdict exists. |
-| Inputs fixed at creation, not at resolution time | `resolve(market_id)` has one parameter; `test_resolve_takes_no_url_no_rule_and_no_outcome`. |
-| Untrusted data | Question, outcome labels, rule and page excerpts are fenced, inner fences scrubbed, injection phrasing flagged and stored. |
-| Bounded, deterministic evidence | SHA-256 over the whole normalized document; ≤4000 chars of non-overlapping windows for the model. |
+| A payable method that really receives value | `predict` is `@gl.public.write.payable` and reads `gl.message.value`; steps 3–7 move the contract balance. |
+| A payout that really reaches a wallet | `pay_wallet` uses an `@gl.evm.contract_interface` proxy, i.e. an external transfer. An internal message to a wallet succeeds and pays nobody. Steps 10, 11, 16, 19, 20 move the balance down to 0. |
+| Value stranded by a revert | Value attached to a reverting call is not returned, so `predict` never raises once value is attached. Step 7 is refused and credited; `test_with_value_attached_predict_never_raises_and_credits_everything_back`. |
+| No privileged withdrawal | No owner, fee or sweep. `test_payouts_are_external_wallet_transfers_and_nothing_else_moves_money`, `test_a_claim_pays_the_predictor_and_nobody_else`. |
+| Solvency | `test_balance_equals_what_is_owed_through_a_random_run`: balance == unclaimed escrow + credits after every step of thirty random markets. Shares are `pot // winners`. |
+| Re-entrancy style ordering | Claimed flag and `paid_out` are written before the transfer is emitted; `test_the_books_are_updated_before_the_transfer_is_emitted`. |
+| Rate limits are elapsed time; inputs fixed at creation; literal JSON types; fail closed; untrusted data | Unchanged from v1 — see `tests/test_adversarial.py`. The stake is one more input fixed at creation. |
+| Bounded evidence with no gaps | A page that fits the 4000-char budget is read whole; `test_a_page_that_fits_the_budget_is_read_whole`. |

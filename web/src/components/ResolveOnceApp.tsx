@@ -15,8 +15,12 @@ import {
   txUrl,
 } from "@/lib/config";
 import {
+  claim,
   createMarket,
   expire,
+  getBalance,
+  getClaimable,
+  getCredit,
   getEvents,
   getMarket,
   getPredictions,
@@ -25,6 +29,8 @@ import {
   listIds,
   predict,
   resolve,
+  withdrawCredit,
+  type Claimable,
   type EventRow,
   type MarketRow,
   type Prediction,
@@ -44,6 +50,26 @@ const span = (seconds: number) =>
     : seconds >= 3600
       ? `${Math.round(seconds / 360) / 10} h`
       : `${Math.round(seconds / 6) / 10} min`;
+
+/** Wei as GEN, trimmed: 1500000000000000000 -> "1.5". */
+const fmtGen = (wei: string | number | undefined) => {
+  let v: bigint;
+  try {
+    v = BigInt(wei || 0);
+  } catch {
+    return "0";
+  }
+  const whole = v / BigInt(10 ** 18);
+  const frac = (v % BigInt(10 ** 18)).toString().padStart(18, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac.slice(0, 6)}` : `${whole}`;
+};
+
+/** GEN typed by a person as wei, or "" when it is not a number. */
+const toWei = (text: string) => {
+  const m = /^(\d+)(?:\.(\d{1,18}))?$/.exec(text.trim());
+  if (!m) return "";
+  return (BigInt(m[1]) * BigInt(10 ** 18) + BigInt((m[2] || "").padEnd(18, "0") || "0")).toString();
+};
 
 const ROUND: Record<string, { text: string; tone: string }> = {
   none: { text: "no round yet", tone: "neutral" },
@@ -96,6 +122,9 @@ export function ResolveOnceApp() {
   const [rows, setRows] = useState<MarketRow[]>([]);
   const [schedules, setSchedules] = useState<Record<string, Schedule>>({});
   const [books, setBooks] = useState<Record<string, Prediction[]>>({});
+  const [claimables, setClaimables] = useState<Record<string, Claimable>>({});
+  const [credit, setCredit] = useState("0");
+  const [held, setHeld] = useState("0");
   const [events, setEvents] = useState<EventRow[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
   const [gen, setGen] = useState("");
@@ -116,12 +145,19 @@ export function ResolveOnceApp() {
   const [confirmations, setConfirmations] = useState("2");
   const [confirmInterval, setConfirmInterval] = useState("180");
   const [expireIn, setExpireIn] = useState("86400");
+  const [stakeGen, setStakeGen] = useState("1");
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [ids, s, ev] = await Promise.all([listIds(), getStats(), getEvents()]);
+      const [ids, s, ev, bal] = await Promise.all([
+        listIds(),
+        getStats(),
+        getEvents(),
+        getBalance(),
+      ]);
       setStats(s);
+      setHeld(bal);
       setEvents(ev.slice(-10).reverse());
       const loaded = await Promise.all(ids.map((id) => getMarket(id)));
       setRows((loaded.filter(Boolean) as MarketRow[]).reverse());
@@ -133,7 +169,17 @@ export function ResolveOnceApp() {
       );
       const preds = await Promise.all(ids.map((id) => getPredictions(id)));
       setBooks(Object.fromEntries(ids.map((id, i) => [id, preds[i]])));
-      if (address) setGen(await getNativeBalance(address));
+      if (address) {
+        setGen(await getNativeBalance(address));
+        setCredit(await getCredit(address));
+        const mine = await Promise.all(ids.map((id) => getClaimable(id, address)));
+        setClaimables(
+          Object.fromEntries(ids.flatMap((id, i) => (mine[i] ? [[id, mine[i] as Claimable]] : []))),
+        );
+      } else {
+        setCredit("0");
+        setClaimables({});
+      }
     } catch (e) {
       setMsg(`Error: ${e instanceof Error ? e.message : "read failed"}`);
       setOk(false);
@@ -182,6 +228,7 @@ export function ResolveOnceApp() {
     .split("\n")
     .map((x) => x.trim())
     .filter(Boolean);
+  const stakeWei = toWei(stakeGen);
 
   return (
     <main className="wrap">
@@ -195,7 +242,8 @@ export function ResolveOnceApp() {
             creator commits the question, the outcomes, one source page and the rule for reading
             it. After the committed time anyone can ask the network to read that page — and an
             outcome becomes final only when <strong>separated consensus rounds agree</strong> on
-            the same one.
+            the same one. Predictions carry a real stake: it sits in the contract until the
+            market settles, then the winners split the pot — or everyone gets their stake back.
           </p>
           <div className="chips">
             <span className="chip">
@@ -217,6 +265,15 @@ export function ResolveOnceApp() {
                 </span>
                 <span className="chip">
                   predictions <b>{stats.predictions}</b>
+                </span>
+                <span className="chip">
+                  staked <b>{fmtGen(stats.staked)} GEN</b>
+                </span>
+                <span className="chip">
+                  paid out <b>{fmtGen(stats.paid_out)} GEN</b>
+                </span>
+                <span className="chip hot">
+                  held now <b>{fmtGen(held)} GEN</b>
                 </span>
               </>
             )}
@@ -248,6 +305,21 @@ export function ResolveOnceApp() {
               </button>
             )}
           </div>
+          {address && credit !== "0" && (
+            <p className="verdictbox">
+              The contract holds <strong>{fmtGen(credit)} GEN</strong> for you that it could not put
+              into a market (an overpaid or refused stake).{" "}
+              <button
+                className="ghost tiny"
+                disabled={!!busy}
+                onClick={() =>
+                  void run("withdraw_credit", () => withdrawCredit(acct, provider, onStage))
+                }
+              >
+                take it back
+              </button>
+            </p>
+          )}
           {walletError && <p className="msg">{walletError}</p>}
           {msg && <p className={ok ? "okmsg" : "msg"}>{msg}</p>}
           {tx && (
@@ -326,8 +398,21 @@ export function ResolveOnceApp() {
               />
             </div>
           </div>
-          <label htmlFor="expireIn">Void if unresolved after (s)</label>
-          <input id="expireIn" value={expireIn} onChange={(e) => setExpireIn(e.target.value)} />
+          <div className="grid2">
+            <div>
+              <label htmlFor="expireIn">Void if unresolved after (s)</label>
+              <input id="expireIn" value={expireIn} onChange={(e) => setExpireIn(e.target.value)} />
+            </div>
+            <div>
+              <label htmlFor="stakeGen">Stake per prediction (GEN, 0 = free)</label>
+              <input id="stakeGen" value={stakeGen} onChange={(e) => setStakeGen(e.target.value)} />
+            </div>
+          </div>
+          <p className="muted">
+            The stake is equal for everyone and fixed here. The pot is stake × predictions; it
+            goes to the winners in equal shares, or back to every predictor if nobody was right or
+            the market expires. No fee is taken and no address can withdraw it any other way.
+          </p>
           <p className="muted">
             With these numbers the earliest possible final result is{" "}
             {span(
@@ -338,7 +423,9 @@ export function ResolveOnceApp() {
             reproducible; a real market would use hours or days.
           </p>
           <button
-            disabled={disabled || !marketId || !question || labels.length < 2 || !rule}
+            disabled={
+              disabled || !marketId || !question || labels.length < 2 || !rule || stakeWei === ""
+            }
             onClick={() =>
               void run("create_market", () =>
                 createMarket(
@@ -355,6 +442,7 @@ export function ResolveOnceApp() {
                     confirmations,
                     confirmInterval,
                     expireIn,
+                    stake: stakeWei,
                   },
                   onStage,
                 ),
@@ -420,6 +508,8 @@ export function ResolveOnceApp() {
           const mine = address
             ? book.find((p) => p.address.toLowerCase() === address.toLowerCase())
             : undefined;
+          const due = claimables[m.market_id];
+          const staked = m.stake && m.stake !== "0";
           const res = ROUND[m.last_round] || { text: m.last_round, tone: "neutral" };
           const tone = m.status === "resolved" ? "ok" : m.status === "void" ? "neutral" : res.tone;
           return (
@@ -462,6 +552,17 @@ export function ResolveOnceApp() {
               </p>
               <p className="hashline">rule: {m.resolution_rule}</p>
               <p className="hashline">
+                {staked ? (
+                  <>
+                    stake <strong>{fmtGen(m.stake)} GEN</strong> per prediction · pot{" "}
+                    <strong>{fmtGen(m.pot)} GEN</strong> · paid out {fmtGen(m.paid_out)} GEN in{" "}
+                    {m.claims} claim(s)
+                  </>
+                ) : (
+                  "free market: predictions carry no stake"
+                )}
+              </p>
+              <p className="hashline">
                 resolution from {utc(m.resolve_at)} · rounds ≥ {span(m.confirm_interval)} apart ·
                 void after {utc(m.expires_at)}
                 {m.last_page_hash && (
@@ -489,8 +590,28 @@ export function ResolveOnceApp() {
                   <strong>final: {m.final_label}.</strong> {book.filter((p) => p.correct).length}{" "}
                   of {book.length} prediction(s) were right
                   {mine ? ` — yours was ${mine.correct ? "right" : "wrong"}` : ""}.
+                  {staked &&
+                    (book.some((p) => p.correct)
+                      ? " The winners split the pot in equal shares."
+                      : " Nobody was right, so every stake goes back.")}
                 </p>
               )}
+              {m.status === "void" && staked && (
+                <p className="verdictbox">
+                  <strong>void.</strong> The market expired without a final result, so every
+                  predictor takes their stake back.
+                </p>
+              )}
+              {due && due.amount !== "0" && (
+                <button
+                  style={{ marginRight: "0.5rem" }}
+                  disabled={disabled}
+                  onClick={() => void run("claim", () => claim(acct, provider, m.market_id, onStage))}
+                >
+                  claim {fmtGen(due.amount)} GEN ({due.kind === "refund" ? "stake back" : "winnings"})
+                </button>
+              )}
+              {mine?.claimed && <span className="muted">you have claimed · </span>}
               {m.injection_flags?.length > 0 && (
                 <p className="hashline flagged">
                   injection phrasing seen in the data: {m.injection_flags.join(", ")}
@@ -505,10 +626,13 @@ export function ResolveOnceApp() {
                     style={{ marginRight: "0.5rem" }}
                     disabled={disabled}
                     onClick={() =>
-                      void run("predict", () => predict(acct, provider, m.market_id, i, onStage))
+                      void run("predict", () =>
+                        predict(acct, provider, m.market_id, i, m.stake, onStage),
+                      )
                     }
                   >
                     predict {label}
+                    {staked ? ` · ${fmtGen(m.stake)} GEN` : ""}
                   </button>
                 ))}
               {mine && m.status !== "resolved" && (
@@ -562,6 +686,7 @@ export function ResolveOnceApp() {
                     e.confirmations
                       ? `${e.confirmations}/${e.confirmations_required ?? e.confirmations}`
                       : null,
+                    e.kind === "Claimed" ? `${e.what} ${fmtGen(String(e.amount))} GEN` : null,
                     typeof e.at === "number" ? utc(e.at) : null,
                   ]
                     .filter(Boolean)

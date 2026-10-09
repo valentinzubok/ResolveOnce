@@ -1,6 +1,6 @@
 /** Live ResolveOnce deploy on GenLayer Studio Dev (chain 61997). Override via env. */
 export const CONTRACT_ADDRESS = (process.env.NEXT_PUBLIC_RESOLVEONCE_ADDRESS ||
-  "0x6FB445e8edC50A7B01C88faBf8B0E925a2001355") as `0x${string}`;
+  "0xE4cBaaF13Aaf6aF3c8c5414bB5BaC1e5E60ABcBc") as `0x${string}`;
 
 /** Studio Dev / Studio Next — chain ID 61997. */
 export const CHAIN_ID = 61997;

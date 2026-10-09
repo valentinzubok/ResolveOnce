@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>A market resolution nobody is trusted to announce.</strong>
+  <strong>A market resolution nobody is trusted to announce — with real stakes behind it.</strong>
 </p>
 
 <p align="center">
@@ -24,17 +24,22 @@ wrong, bribed or simply early; a multisig moves the same problem to five people;
 oracle cannot read a governance page, a court docket or a results table at all.
 
 **ResolveOnce makes "what does the source say happened?" a consensus question, and makes one
-answer not enough.**
+answer not enough.** Since v2 the predictions carry money: every stake is escrowed in the contract
+and can leave it in exactly three ways — to the winners, or back to everyone if nobody was right,
+or back to everyone if the market expires.
 
 ```
 create_market(market_id, question, outcomes_json, source_url, resolution_rule,
               predictions_close_in, resolve_in,
-              confirmations_required, confirm_interval, expire_in)
+              confirmations_required, confirm_interval, expire_in, stake)
       the question, the closed list of outcomes, the ONE page that will carry the result,
-      the rule for reading it and every time limit are fixed here. Nothing has a setter.
+      the rule for reading it, every time limit and the stake are fixed here. No setters.
 
-predict(market_id, outcome_index)    one prediction per address, immutable, refused once
-                                     predictions_close_at has passed
+predict(market_id, outcome_index)    PAYABLE. One prediction per address, immutable, refused
+                                     once predictions_close_at has passed. On a staked market
+                                     the call carries the stake, which is escrowed here.
+      with value attached it never reverts: what cannot be escrowed (a late, duplicate,
+      underpaid or overpaid prediction) is booked as a credit for the sender
 
 resolve(market_id)                   anyone may call it; it takes a market id and nothing else
       refused before the committed resolve time, and before a full confirm_interval has
@@ -48,7 +53,15 @@ resolve(market_id)                   anyone may call it; it takes a market id an
       after confirmations_required agreeing rounds, each a full interval apart: FINAL
 
 expire(market_id)                    anyone, once expires_at has passed without a final result
+
+claim(market_id)                     the predictor only, for themselves
+        resolved, somebody was right  -> winners split the pot in equal shares
+        resolved, nobody was right    -> every predictor takes their stake back
+        expired unresolved            -> every predictor takes their stake back
+withdraw_credit()                    take back what predict() could not escrow for you
+
 get_outcome(market_id)               what a consumer reads: {final, outcome_index, outcome_label}
+get_pot / get_claimable / get_credit / get_balance      the money side, free to read
 ```
 
 ### Why it fails the way it does
@@ -66,9 +79,13 @@ model answer, a model error or a consensus failure **reverts the transaction**.
 | The model returns `"1"`, `true`, `1.0`, a label, or an index that is not listed | `literal_index()` accepts only a JSON integer inside the outcome list and `literal_bool()` only JSON `true`/`false`. Anything else reverts and no round is recorded. |
 | An outage being read as a result, or as a contradiction | An unreachable or empty source confirms nothing and overturns nothing, and still uses up its interval so it cannot be hammered. |
 | An administrator voiding or forcing a market | There is none: no owner, no admin, no ownership transfer, no `cancel`, no `force_resolve`. The creator has no power once the market exists; the deployer is an ordinary account. |
+| The pot going anywhere but the predictors | There is no fee, no owner cut and no withdrawal function. Money leaves only through `claim` (to the caller, for the caller's own prediction) and `withdraw_credit` (the caller's own credit). `get_balance` minus what `get_pot` and `get_credit` say is owed is at most a few wei of rounding dust. |
+| A stake stranded by a failed call | On GenLayer the value attached to a call that reverts is **not** returned. `predict()` therefore never raises once value is attached: a late, duplicate, underpaid or unknown-market prediction is refused in the return value and the whole amount is credited to the sender; an overpayment is escrowed up to the stake and the rest credited. |
+| A payout that "succeeds" and pays nobody | A wallet is paid with an external transfer through an EVM interface. An internal message to a wallet is emitted, the transaction succeeds, and the balance never moves — that is what a naive `emit_transfer` does. The deploy record shows the balance actually reaching zero. |
+| A double claim, or a claim racing the transfer | The prediction is marked claimed and `paid_out` is increased before the transfer is emitted. Shares are `pot // winners`, so claims can never add up to more than the pot. |
 | A market that can never resolve staying open forever | `expire()` is callable by anyone once the committed `expires_at` has passed, and `create_market()` refuses an expiry that leaves no room for every confirmation round. |
 | The page or the creator's own text steering the model | Question, outcome labels, rule and page excerpts are fenced as untrusted data, inner fences are neutralized, and injection phrasing is flagged to the model and stored on the market. |
-| Only the top of a long page being read | The whole document is hashed; the model reads ≤4000 chars from the head plus non-overlapping windows around the market's own words. |
+| Part of the source page never being read | The whole document is hashed. A page of up to 4000 chars is read whole. A longer one keeps the head, windows around every occurrence of the market's own words, and then the first stretches no window has covered. |
 | Consensus quietly degrading | No fallback: if `prompt_comparative` cannot run, the transaction reverts. `principle` is passed positionally (it is positional-only in GenVM v0.3). |
 
 ## Live
@@ -77,7 +94,7 @@ model answer, a model error or a consensus failure **reverts the transaction**.
 |---|---|
 | Console | **https://valentinzubok.github.io/ResolveOnce/** (reads work with no wallet) |
 | Network | GenLayer Studio Dev / Studio Next — chain `61997` |
-| Contract | [`0x6FB445e8edC50A7B01C88faBf8B0E925a2001355`](https://explorer-studio-dev.genlayer.com/address/0x6FB445e8edC50A7B01C88faBf8B0E925a2001355) |
+| Contract | [`0xE4cBaaF13Aaf6aF3c8c5414bB5BaC1e5E60ABcBc`](https://explorer-studio-dev.genlayer.com/address/0xE4cBaaF13Aaf6aF3c8c5414bB5BaC1e5E60ABcBc) |
 | Contract-only repo | [ResolveOnceCore](https://github.com/valentinzubok/ResolveOnceCore) |
 | Deploy record | [`STUDIO_DEV_DEPLOY.md`](STUDIO_DEV_DEPLOY.md) — every transaction of the demo, including the refused ones |
 
@@ -95,8 +112,9 @@ model answer, a model error or a consensus failure **reverts the transaction**.
 ## The console
 
 [`web/`](web/) — Next.js 16 + `genlayer-js` 2.0.0-rc.1 + MetaMask, exported statically to Pages.
-It reads markets, schedules, predictions and events from chain without a wallet, writes
-`create_market` / `predict` / `resolve` / `expire` through MetaMask with Studio Dev fees, disables
+It reads markets, pots, schedules, predictions and events from chain without a wallet, writes
+`create_market` / `predict` (with the stake as the transaction's value) / `resolve` / `expire` /
+`claim` / `withdraw_credit` through MetaMask with Studio Dev fees, shows what you can claim, disables
 a button whose call would revert (`get_schedule` is a free view), and distinguishes `ACCEPTED`
 from `FINALIZED` rather than presenting acceptance as completion.
 
@@ -110,10 +128,24 @@ npm run dev      # http://localhost:3016
 
 ```bash
 pip install -r requirements-dev.txt
-python3 -m pytest -q      # 51 tests
+python3 -m pytest -q      # 72 tests
 ```
 
-`tests/test_adversarial.py` is the half that matters:
+[`tests/test_stakes.py`](tests/test_stakes.py) covers the money (v2):
+
+- **In.** A prediction escrows exactly the stake; an overpayment is credited back; the stake is
+  fixed at creation; only `predict` is payable.
+- **Never stranded.** With value attached, six different refusals complete without raising and
+  credit the full amount; late predictions and predictions on a settled market too.
+- **Out.** One winner takes the pot; several winners get equal shares; indivisible dust stays put
+  and no claim exceeds the pot; a claim pays the caller and nobody else; nobody right or an expired
+  market refunds every stake; no double claim.
+- **The books balance.** Markets do not share money, and through thirty random markets the
+  contract balance equals unclaimed escrow plus credits after every single step.
+- **How it leaves.** Payouts are external wallet transfers, there is exactly one `emit_transfer`
+  and one payable method in the source, and the books are updated before the transfer is emitted.
+
+`tests/test_adversarial.py` covers the resolution itself:
 
 - **Nothing malformed becomes a result.** Nineteen malformed answers — quoted booleans and
   indexes, `true` as an index, floats, an out-of-range index, a label, a missing key, non-JSON —

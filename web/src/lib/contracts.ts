@@ -28,6 +28,11 @@ export type MarketRow = {
   final_label: string;
   resolved_at: number;
   tally: number[];
+  /** Wei every prediction escrows; "0" on a free market. */
+  stake: string;
+  pot: string;
+  paid_out: string;
+  claims: number;
 };
 
 export type EventRow = { kind: string; [key: string]: unknown };
@@ -49,7 +54,17 @@ export type Schedule = {
   confirm_interval: number;
 };
 
-export type Prediction = { address: string; outcome: number; at: number; correct?: boolean };
+export type Prediction = {
+  address: string;
+  outcome: number;
+  at: number;
+  stake: string;
+  claimed: boolean;
+  correct?: boolean;
+};
+
+/** What an address can take out of a market right now. */
+export type Claimable = { amount: string; kind: "winnings" | "refund" | "nothing"; reason: string };
 
 export type Stats = {
   markets: number;
@@ -58,6 +73,8 @@ export type Stats = {
   resolved: number;
   void: number;
   predictions: number;
+  staked: string;
+  paid_out: string;
   rounds: number;
 };
 
@@ -86,6 +103,22 @@ export async function getPredictions(id: string): Promise<Prediction[]> {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+export async function getClaimable(id: string, address: string): Promise<Claimable | null> {
+  const raw = await readContract<string>(CONTRACT_ADDRESS, "get_claimable", [id, address]);
+  const parsed = parseJson<Claimable & { error?: string }>(raw, {} as Claimable);
+  return parsed.kind ? parsed : null;
+}
+
+/** Wei the contract owes this address outside any market (an overpaid or refused stake). */
+export async function getCredit(address: string): Promise<string> {
+  return (await readContract<string>(CONTRACT_ADDRESS, "get_credit", [address])) || "0";
+}
+
+/** Wei the contract actually holds. */
+export async function getBalance(): Promise<string> {
+  return (await readContract<string>(CONTRACT_ADDRESS, "get_balance", [])) || "0";
+}
+
 export async function getEvents(): Promise<EventRow[]> {
   return parseJson<EventRow[]>(
     await readContract<string>(CONTRACT_ADDRESS, "get_events", []),
@@ -111,6 +144,8 @@ export type NewMarket = {
   confirmations: string;
   confirmInterval: string;
   expireIn: string;
+  /** Wei per prediction. */
+  stake: string;
 };
 
 export async function createMarket(
@@ -135,6 +170,7 @@ export async function createMarket(
       m.confirmations,
       m.confirmInterval,
       m.expireIn,
+      m.stake,
     ],
     onStage,
   );
@@ -145,8 +181,10 @@ export async function predict(
   provider: unknown,
   marketId: string,
   outcomeIndex: number,
+  stake: string,
   onStage?: OnStage,
 ) {
+  // The stake travels as the transaction's value; the contract escrows exactly that much.
   return writeAndWait(
     account,
     provider,
@@ -154,7 +192,21 @@ export async function predict(
     "predict",
     [marketId, String(outcomeIndex)],
     onStage,
+    BigInt(stake || "0"),
   );
+}
+
+export async function claim(
+  account: Address,
+  provider: unknown,
+  marketId: string,
+  onStage?: OnStage,
+) {
+  return writeAndWait(account, provider, CONTRACT_ADDRESS, "claim", [marketId], onStage);
+}
+
+export async function withdrawCredit(account: Address, provider: unknown, onStage?: OnStage) {
+  return writeAndWait(account, provider, CONTRACT_ADDRESS, "withdraw_credit", [], onStage);
 }
 
 export async function resolve(
